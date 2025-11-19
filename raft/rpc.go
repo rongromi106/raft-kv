@@ -14,6 +14,7 @@ type AppendEntriesRequest struct {
 	PrevLogTerm  Term
 	Entries      []LogEntry
 	LeaderCommit LogIndex
+	IsHeartbeat  bool
 }
 
 type AppendEntriesResponse struct {
@@ -39,6 +40,8 @@ type RPCType int
 const (
 	RPCAppendEntries RPCType = iota
 	RPCRequestVote
+	RPCRequestVoteResponse
+	RPCAppendEntriesResponse
 )
 
 type RPCMessage struct {

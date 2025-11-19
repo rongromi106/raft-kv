@@ -34,6 +34,13 @@ func main() {
 
 	logger.Println("raft cluster started, press Ctrl+C to stop...")
 
+	go func() {
+		time.Sleep(3 * time.Second)
+		logger.Println("cluster --> killing current leader")
+		prevLeader := memCluster.KillCurrentLeader()
+		logger.Printf("cluster --> previous leader %s killed", prevLeader)
+	}()
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
