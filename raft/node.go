@@ -22,6 +22,8 @@ type RaftNode struct {
 	electionTimer *time.Timer
 
 	mu sync.Mutex
+
+	peerIds []NodeID
 }
 
 func NewRaftNode(cfg Config, cluster Cluster) *RaftNode {
@@ -79,9 +81,9 @@ func (n *RaftNode) run(ctx context.Context) {
 
 		case <-n.electionTimer.C:
 			term, role := n.state.getTermAndRole()
-			n.logger.Printf("[node %s] election timeout fired (term=%d, role=%s) -> would start election here",
+			n.startElection()
+			n.logger.Printf("[node %s] election timeout fired (term=%d, role=%s) -> starting election",
 				n.id, term, role)
-
 			n.resetElectionTimer(newElectionTimeout(n.cfg.MinElectionTimeout, n.cfg.MaxElectionTimeout))
 
 		case msg := <-n.recvRPCCh:
@@ -106,7 +108,48 @@ func (n *RaftNode) resetElectionTimer(d time.Duration) {
 }
 
 func (n *RaftNode) handleRPC(msg RPCMessage) {
-	term, role := n.state.getTermAndRole()
-	n.logger.Printf("[node %s] received RPC type=%v from=%s (term=%d, role=%s) [no-op in Milestone1]",
-		n.id, msg.Type, msg.From, term, role)
+	switch msg.Type {
+	case RPCRequestVote:
+		n.logger.Printf("[node %s] received RequestVote request from=%s (term=%d)",
+			n.id, msg.From, msg.RequestVoteReq.Term)
+
+	case RPCAppendEntries:
+		n.logger.Printf("[node %s] received AppendEntries request from=%s (term=%d)",
+			n.id, msg.From, msg.AppendEntriesReq.Term)
+
+	default:
+		term, role := n.state.getTermAndRole()
+		n.logger.Printf("[node %s] received RPC type=%v from=%s (term=%d, role=%s) [no-op in Milestone1]",
+			n.id, msg.Type, msg.From, term, role)
+	}
+
+}
+
+func (n *RaftNode) startElection() {
+	/*
+		currentTerm++
+		role = Candidate
+		votedFor = self
+		voteCount = 1
+		broadcast RequestVote
+		reset election timer
+	*/
+	n.state.mu.Lock()
+	n.state.currentTerm++
+	n.state.role = RoleCandidate
+	n.state.votedFor = &n.id
+
+	n.state.voteCount = 1
+	n.state.mu.Unlock()
+	currentTerm, _ := n.state.getTermAndRole()
+	for _, peerId := range n.peerIds {
+		// TODO: fix lastlog index and last log term in milestone 3
+		n.cluster.SendRequestVote(n.id, peerId, &RequestVoteRequest{
+			Term:         currentTerm,
+			CandidateID:  n.id,
+			LastLogIndex: 0,
+			LastLogTerm:  0,
+		})
+	}
+	n.resetElectionTimer(newElectionTimeout(n.cfg.MinElectionTimeout, n.cfg.MaxElectionTimeout))
 }

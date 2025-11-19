@@ -12,7 +12,8 @@ type RaftState struct {
 	commitIndex LogIndex
 	lastApplied LogIndex
 
-	role Role
+	role      Role
+	voteCount int
 }
 
 func newRaftState() *RaftState {
