@@ -1,0 +1,13 @@
+实验对比固定/随机超时时选主冲突和耗时分布
+
+RAFT Cluster Size: 3
+Running for 10 seconds with Random Election Timeouts
+election tracker samples: 
+[387.875µs 279.626417ms 501.355042ms 335.411834ms 306.7745ms 464.292µs 315.489792ms 285.06325ms 359.418625ms 390.492083ms]
+
+Running for 10 seconds with Fixed Election Timeouts
+election tracker samples: 
+[186.458µs 573.375µs 245.542µs 282.083µs 179.042µs 299.5µs 195.25µs 94.917µs 537.334µs 530.958µs 442.167µs 168.041µs 457.583µs 201.625µs 445.709µs 392.041µs 
+289.5µs 247.708µs 585.166µs 368.917µs 205.5µs 210.125µs 169.708µs 109.75µs 128.625µs 193.416µs]
+
+Conclusion: Way more elections happening for Fixed Election Timeouts

@@ -5,12 +5,23 @@ import (
 	"time"
 )
 
+type ElectionTimeoutMode int
+
+const (
+	ElectionTimeoutRandom ElectionTimeoutMode = iota
+	ElectionTimeoutFixed
+)
+
 type Config struct {
 	ID NodeID
 
 	HeartbeatInterval  time.Duration
 	MinElectionTimeout time.Duration
 	MaxElectionTimeout time.Duration
+
+	// ElectionTimeoutMode selects whether to use randomized or fixed election timeouts.
+	// Default is ElectionTimeoutRandom.
+	ElectionTimeoutMode ElectionTimeoutMode
 
 	Logger *log.Logger
 }

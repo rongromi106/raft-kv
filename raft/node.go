@@ -23,6 +23,9 @@ type RaftNode struct {
 
 	heartbeatTimer *time.Timer
 
+	// Used only when ElectionTimeoutMode == ElectionTimeoutFixed
+	fixedElectionTimeout time.Duration
+
 	mu sync.Mutex
 
 	peerIds []NodeID
@@ -44,14 +47,19 @@ func NewRaftNode(cfg Config, cluster Cluster) *RaftNode {
 		stopped:   make(chan struct{}),
 	}
 
+	// Initialize per-node fixed election timeout if configured
+	if c.ElectionTimeoutMode == ElectionTimeoutFixed {
+		// node always use the same election timeout
+		n.fixedElectionTimeout = newElectionTimeout(c.MinElectionTimeout, c.MaxElectionTimeout)
+	}
+
 	return n
 }
 
 func (n *RaftNode) Start(ctx context.Context) error {
 	n.logger.Printf("[node %s] starting", n.id)
 
-	timeout := newElectionTimeout(n.cfg.MinElectionTimeout, n.cfg.MaxElectionTimeout)
-	n.resetElectionTimer(timeout)
+	n.resetElectionTimerByMode()
 
 	go n.run(ctx)
 	return nil
@@ -96,7 +104,7 @@ func (n *RaftNode) run(ctx context.Context) {
 			n.startElection()
 			n.logger.Printf("[node %s] election timeout fired (term=%d, role=%s) -> starting election",
 				n.id, term, role)
-			n.resetElectionTimer(newElectionTimeout(n.cfg.MinElectionTimeout, n.cfg.MaxElectionTimeout))
+			n.resetElectionTimerByMode()
 
 		case msg := <-n.recvRPCCh:
 			n.handleRPC(msg)
@@ -127,6 +135,38 @@ func (n *RaftNode) resetElectionTimer(d time.Duration) {
 		n.electionTimer.Reset(d)
 	}
 	n.logger.Printf("[node %s] reset election timer to %v", n.id, d)
+}
+
+// resetElectionTimerFixed resets the election timer using a fixed duration,
+// typically the configured MinElectionTimeout. This provides an option to
+// run elections on a fixed schedule instead of randomized intervals.
+func (n *RaftNode) resetElectionTimerFixed() {
+	d := n.fixedElectionTimeout
+	if d == 0 {
+		// Fallback in case not pre-initialized; keep behavior deterministic per call site
+		d = n.cfg.MinElectionTimeout
+	}
+	if n.electionTimer == nil {
+		n.electionTimer = time.NewTimer(d)
+	} else {
+		if !n.electionTimer.Stop() {
+			select {
+			case <-n.electionTimer.C:
+			default:
+			}
+		}
+		n.electionTimer.Reset(d)
+	}
+	n.logger.Printf("[node %s] reset election timer (fixed) to %v", n.id, d)
+}
+
+// resetElectionTimerByMode picks fixed or randomized timeout based on config.
+func (n *RaftNode) resetElectionTimerByMode() {
+	if n.cfg.ElectionTimeoutMode == ElectionTimeoutFixed {
+		n.resetElectionTimerFixed()
+		return
+	}
+	n.resetElectionTimer(newElectionTimeout(n.cfg.MinElectionTimeout, n.cfg.MaxElectionTimeout))
 }
 
 func (n *RaftNode) resetHeartbeatTimer(d time.Duration) {
@@ -192,13 +232,18 @@ func (n *RaftNode) startElection() {
 		reset election timer
 	*/
 	n.state.mu.Lock()
+	oldRole := n.state.role
 	n.state.currentTerm++
 	n.state.role = RoleCandidate
 	n.state.votedFor = &n.id
 
 	n.state.voteCount = 1
+	term := n.state.currentTerm
 	n.state.mu.Unlock()
-	currentTerm, _ := n.state.getTermAndRole()
+	if oldRole != RoleCandidate {
+		n.onRoleChange(term, oldRole, RoleCandidate)
+	}
+	currentTerm := term
 	for _, peerId := range n.peerIds {
 		// TODO: fix lastlog index and last log term in milestone 3
 		n.cluster.SendRequestVote(n.id, peerId, &RequestVoteRequest{
@@ -208,7 +253,7 @@ func (n *RaftNode) startElection() {
 			LastLogTerm:  0,
 		})
 	}
-	n.resetElectionTimer(newElectionTimeout(n.cfg.MinElectionTimeout, n.cfg.MaxElectionTimeout))
+	n.resetElectionTimerByMode()
 }
 
 func (n *RaftNode) handleRequestVote(req *RequestVoteRequest) {
@@ -217,6 +262,7 @@ func (n *RaftNode) handleRequestVote(req *RequestVoteRequest) {
 	// vote granted for leader and reset election timeout to prevent unnecessary elections
 	if req.Term > n.state.currentTerm && (n.state.votedFor == nil || *n.state.votedFor == req.CandidateID) {
 		// step down and record vote
+		oldRole := n.state.role
 		n.state.currentTerm = req.Term
 		n.state.votedFor = &req.CandidateID
 		n.state.role = RoleFollower
@@ -230,7 +276,10 @@ func (n *RaftNode) handleRequestVote(req *RequestVoteRequest) {
 			VoteGranted: true,
 		})
 		n.stopHeartbeatTimer()
-		n.resetElectionTimer(newElectionTimeout(n.cfg.MinElectionTimeout, n.cfg.MaxElectionTimeout))
+		n.resetElectionTimerByMode()
+		if oldRole != RoleFollower {
+			n.onRoleChange(term, oldRole, RoleFollower)
+		}
 		return
 	}
 
@@ -244,8 +293,13 @@ func (n *RaftNode) handleRequestVoteResponse(resp *RequestVoteResponse) {
 	if resp.VoteGranted {
 		n.state.voteCount++
 		if n.state.voteCount > len(n.peerIds)/2 {
+			oldRole := n.state.role
 			n.state.role = RoleLeader
+			term := n.state.currentTerm
 			n.state.mu.Unlock()
+			if oldRole != RoleLeader {
+				n.onRoleChange(term, oldRole, RoleLeader)
+			}
 			n.cluster.SetCurrentLeader(n.id)
 			n.startHeartbeat()
 			return
@@ -258,7 +312,6 @@ func (n *RaftNode) startHeartbeat() {
 	n.state.mu.Lock()
 	defer n.state.mu.Unlock()
 
-	n.state.role = RoleLeader
 	for _, peerId := range n.peerIds {
 		if peerId == n.id {
 			continue
@@ -282,13 +335,18 @@ func (n *RaftNode) handleAppendEntries(req *AppendEntriesRequest) {
 	n.state.mu.Lock()
 
 	if req.Term > n.state.currentTerm {
+		oldRole := n.state.role
 		n.state.currentTerm = req.Term
 		n.state.votedFor = nil
 		n.state.role = RoleFollower
 		n.state.voteCount = 0
+		term := n.state.currentTerm
 		// step down: ensure we stop heartbeats
 		n.state.mu.Unlock()
 		n.stopHeartbeatTimer()
+		if oldRole != RoleFollower {
+			n.onRoleChange(term, oldRole, RoleFollower)
+		}
 		return
 	} else if req.Term < n.state.currentTerm {
 		n.cluster.SendAppendEntriesResponse(n.id, req.LeaderID, &AppendEntriesResponse{
@@ -305,16 +363,25 @@ func (n *RaftNode) handleAppendEntriesResponse(resp *AppendEntriesResponse) {
 	n.state.mu.Lock()
 
 	if !resp.Success {
+		oldRole := n.state.role
 		n.state.currentTerm = resp.Term
 		n.state.votedFor = nil
 		n.state.role = RoleFollower
 		n.state.voteCount = 0
+		term := n.state.currentTerm
 		n.state.mu.Unlock()
 		n.stopHeartbeatTimer()
-		n.resetElectionTimer(newElectionTimeout(n.cfg.MinElectionTimeout, n.cfg.MaxElectionTimeout))
+		n.resetElectionTimerByMode()
+		if oldRole != RoleFollower {
+			n.onRoleChange(term, oldRole, RoleFollower)
+		}
 		return
 	}
 
 	// TODO: handle success
 	n.state.mu.Unlock()
+}
+
+func (n *RaftNode) onRoleChange(term Term, oldRole, newRole Role) {
+	n.cluster.SendRoleChange(n.id, term, oldRole, newRole)
 }

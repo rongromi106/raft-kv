@@ -11,16 +11,20 @@ type MemoryCluster struct {
 	nodes         map[NodeID]*RaftNode
 	logger        *log.Logger
 	currentLeader NodeID
+	tracker       *ElectionTracker
 }
 
 type Cluster interface {
 	SendAppendEntries(from, to NodeID, req *AppendEntriesRequest)
 	SendRequestVote(from, to NodeID, req *RequestVoteRequest)
 	Init(ctx context.Context) error
+	Stop()
 	SendRequestVoteResponse(from, to NodeID, resp *RequestVoteResponse)
 	SendAppendEntriesResponse(from, to NodeID, resp *AppendEntriesResponse)
 	SetCurrentLeader(leader NodeID)
 	KillCurrentLeader() NodeID
+	SendRoleChange(node NodeID, term Term, oldRole, newRole Role)
+	ElectionSamples() []time.Duration
 }
 
 func NewMemoryCluster(clusterSize int) Cluster {
@@ -30,11 +34,12 @@ func NewMemoryCluster(clusterSize int) Cluster {
 	}
 	for i := 0; i < clusterSize; i++ {
 		node := NewRaftNode(Config{
-			ID:                 NodeID(fmt.Sprintf("node-%d", i)),
-			HeartbeatInterval:  100 * time.Millisecond,
-			MinElectionTimeout: 300 * time.Millisecond,
-			MaxElectionTimeout: 600 * time.Millisecond,
-			Logger:             log.Default(),
+			ID:                  NodeID(fmt.Sprintf("node-%d", i)),
+			HeartbeatInterval:   100 * time.Millisecond,
+			MinElectionTimeout:  300 * time.Millisecond,
+			MaxElectionTimeout:  600 * time.Millisecond,
+			Logger:              log.Default(),
+			ElectionTimeoutMode: ElectionTimeoutFixed,
 		}, cluster)
 		cluster.nodes[node.id] = node
 	}
@@ -48,6 +53,7 @@ func NewMemoryCluster(clusterSize int) Cluster {
 			selfNode.peerIds = append(selfNode.peerIds, NodeID(fmt.Sprintf("node-%d", j)))
 		}
 	}
+	cluster.tracker = NewElectionTracker(cluster.nodes)
 	return cluster
 }
 
@@ -126,4 +132,12 @@ func (c *MemoryCluster) KillCurrentLeader() NodeID {
 	c.nodes[leader].stopHeartbeatTimer()
 	c.currentLeader = ""
 	return leader
+}
+
+func (c *MemoryCluster) SendRoleChange(node NodeID, term Term, oldRole, newRole Role) {
+	c.tracker.OnRoleChange(node, term, oldRole, newRole)
+}
+
+func (c *MemoryCluster) ElectionSamples() []time.Duration {
+	return c.tracker.Samples()
 }
