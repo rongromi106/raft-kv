@@ -12,6 +12,7 @@ type MemoryCluster struct {
 	logger        *log.Logger
 	currentLeader NodeID
 	tracker       *ElectionTracker
+	network       *NetworkSimulator
 }
 
 type Cluster interface {
@@ -39,7 +40,7 @@ func NewMemoryCluster(clusterSize int) Cluster {
 			MinElectionTimeout:  300 * time.Millisecond,
 			MaxElectionTimeout:  600 * time.Millisecond,
 			Logger:              log.Default(),
-			ElectionTimeoutMode: ElectionTimeoutFixed,
+			ElectionTimeoutMode: ElectionTimeoutRandom,
 		}, cluster)
 		cluster.nodes[node.id] = node
 	}
@@ -54,55 +55,27 @@ func NewMemoryCluster(clusterSize int) Cluster {
 		}
 	}
 	cluster.tracker = NewElectionTracker(cluster.nodes)
+	// Initialize network simulator with no delay/drop by default.
+	cluster.network = NewNetworkSimulator(0, 0, 0, func(to NodeID, msg RPCMessage) {
+		cluster.nodes[to].recvRPCCh <- msg
+	})
 	return cluster
 }
 
 func (c *MemoryCluster) SendAppendEntries(from, to NodeID, req *AppendEntriesRequest) {
-	msg := RPCMessage{
-		From:             from,
-		To:               to,
-		Type:             RPCAppendEntries,
-		AppendEntriesReq: req,
-	}
-	go func() {
-		c.nodes[to].recvRPCCh <- msg
-	}()
+	c.network.SendAppendEntries(from, to, req)
 }
 
 func (c *MemoryCluster) SendRequestVote(from, to NodeID, req *RequestVoteRequest) {
-	msg := RPCMessage{
-		From:           from,
-		To:             to,
-		Type:           RPCRequestVote,
-		RequestVoteReq: req,
-	}
-	go func() {
-		c.nodes[to].recvRPCCh <- msg
-	}()
+	c.network.SendRequestVote(from, to, req)
 }
 
 func (c *MemoryCluster) SendRequestVoteResponse(from, to NodeID, resp *RequestVoteResponse) {
-	msg := RPCMessage{
-		From:            from,
-		To:              to,
-		Type:            RPCRequestVoteResponse,
-		RequestVoteResp: resp,
-	}
-	go func() {
-		c.nodes[to].recvRPCCh <- msg
-	}()
+	c.network.SendRequestVoteResponse(from, to, resp)
 }
 
 func (c *MemoryCluster) SendAppendEntriesResponse(from, to NodeID, resp *AppendEntriesResponse) {
-	msg := RPCMessage{
-		From:              from,
-		To:                to,
-		Type:              RPCAppendEntriesResponse,
-		AppendEntriesResp: resp,
-	}
-	go func() {
-		c.nodes[to].recvRPCCh <- msg
-	}()
+	c.network.SendAppendEntriesResponse(from, to, resp)
 }
 
 func (c *MemoryCluster) Init(ctx context.Context) error {
