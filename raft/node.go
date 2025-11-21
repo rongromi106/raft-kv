@@ -258,33 +258,54 @@ func (n *RaftNode) startElection() {
 
 func (n *RaftNode) handleRequestVote(req *RequestVoteRequest) {
 	n.state.mu.Lock()
+	// Decide vote under lock; perform side effects after unlocking
+	currentTerm := n.state.currentTerm
+	oldRole := n.state.role
+	stepDown := false
+	grant := false
 
-	// vote granted for leader and reset election timeout to prevent unnecessary elections
-	if req.Term > n.state.currentTerm && (n.state.votedFor == nil || *n.state.votedFor == req.CandidateID) {
-		// step down and record vote
-		oldRole := n.state.role
-		n.state.currentTerm = req.Term
-		n.state.votedFor = &req.CandidateID
-		n.state.role = RoleFollower
-		n.state.voteCount = 0
+	if req.Term < currentTerm {
+		// lower term -> reject
 		term := n.state.currentTerm
-		candidateID := req.CandidateID
 		n.state.mu.Unlock()
-		// actions after releasing lock
-		n.cluster.SendRequestVoteResponse(n.id, candidateID, &RequestVoteResponse{
+		n.cluster.SendRequestVoteResponse(n.id, req.CandidateID, &RequestVoteResponse{
 			Term:        term,
-			VoteGranted: true,
+			VoteGranted: false,
 		})
-		n.stopHeartbeatTimer()
-		n.resetElectionTimerByMode()
-		if oldRole != RoleFollower {
-			n.onRoleChange(term, oldRole, RoleFollower)
-		}
 		return
 	}
 
-	// reject vote request
+	if req.Term > currentTerm {
+		// observe higher term -> step down to follower
+		n.state.currentTerm = req.Term
+		n.state.role = RoleFollower
+		n.state.votedFor = nil
+		n.state.voteCount = 0
+		stepDown = true
+	}
+
+	// Term is now equal to req.Term
+	if n.state.votedFor == nil || (n.state.votedFor != nil && *n.state.votedFor == req.CandidateID) {
+		n.state.votedFor = &req.CandidateID
+		grant = true
+	}
+	term := n.state.currentTerm
+	candidateID := req.CandidateID
 	n.state.mu.Unlock()
+
+	// Perform side effects
+	if stepDown && oldRole != RoleFollower {
+		n.stopHeartbeatTimer()
+		n.onRoleChange(term, oldRole, RoleFollower)
+	}
+
+	n.cluster.SendRequestVoteResponse(n.id, candidateID, &RequestVoteResponse{
+		Term:        term,
+		VoteGranted: grant,
+	})
+	if grant {
+		n.resetElectionTimerByMode()
+	}
 }
 
 func (n *RaftNode) handleRequestVoteResponse(resp *RequestVoteResponse) {

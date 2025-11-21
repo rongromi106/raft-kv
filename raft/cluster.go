@@ -28,12 +28,16 @@ type Cluster interface {
 	ElectionSamples() []time.Duration
 }
 
-func NewMemoryCluster(clusterSize int) Cluster {
+func NewMemoryCluster(cfg *ClusterConfig) Cluster {
+	if cfg == nil {
+		def := (&ClusterConfig{}).withThreeNodesPerfectNetwork()
+		cfg = &def
+	}
 	cluster := &MemoryCluster{
 		nodes:  make(map[NodeID]*RaftNode),
 		logger: log.Default(),
 	}
-	for i := 0; i < clusterSize; i++ {
+	for i := 0; i < cfg.ClusterSize; i++ {
 		node := NewRaftNode(Config{
 			ID:                  NodeID(fmt.Sprintf("node-%d", i)),
 			HeartbeatInterval:   100 * time.Millisecond,
@@ -44,10 +48,10 @@ func NewMemoryCluster(clusterSize int) Cluster {
 		}, cluster)
 		cluster.nodes[node.id] = node
 	}
-	for i := 0; i < clusterSize; i++ {
+	for i := 0; i < cfg.ClusterSize; i++ {
 		selfID := NodeID(fmt.Sprintf("node-%d", i))
 		selfNode := cluster.nodes[selfID]
-		for j := 0; j < clusterSize; j++ {
+		for j := 0; j < cfg.ClusterSize; j++ {
 			if j == i {
 				continue
 			}
@@ -55,8 +59,8 @@ func NewMemoryCluster(clusterSize int) Cluster {
 		}
 	}
 	cluster.tracker = NewElectionTracker(cluster.nodes)
-	// Initialize network simulator with no delay/drop by default.
-	cluster.network = NewNetworkSimulator(0, 0, 0, func(to NodeID, msg RPCMessage) {
+	// Initialize network simulator from config (defaults ensured by withThreeNodesPerfectNetwork).
+	cluster.network = NewNetworkSimulator(cfg.NetworkConfig.MinDelayMs, cfg.NetworkConfig.MaxDelayMs, cfg.NetworkConfig.DropRate, func(to NodeID, msg RPCMessage) {
 		cluster.nodes[to].recvRPCCh <- msg
 	})
 	return cluster

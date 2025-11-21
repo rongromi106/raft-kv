@@ -12,6 +12,7 @@ const (
 	ElectionTimeoutFixed
 )
 
+// RaftNodeConfig
 type Config struct {
 	ID NodeID
 
@@ -40,5 +41,25 @@ func (c *Config) withDefaults() Config {
 	if out.Logger == nil {
 		out.Logger = log.Default()
 	}
+	return out
+}
+
+type NetworkConfig struct {
+	MinDelayMs time.Duration
+	MaxDelayMs time.Duration
+	DropRate   float64
+}
+
+type ClusterConfig struct {
+	ClusterSize   int
+	NetworkConfig NetworkConfig
+}
+
+func (c *ClusterConfig) withThreeNodesPerfectNetwork() ClusterConfig {
+	out := *c
+	out.ClusterSize = 3
+	out.NetworkConfig.MinDelayMs = 0
+	out.NetworkConfig.MaxDelayMs = 0
+	out.NetworkConfig.DropRate = 0
 	return out
 }
