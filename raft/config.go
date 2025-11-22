@@ -51,8 +51,9 @@ type NetworkConfig struct {
 }
 
 type ClusterConfig struct {
-	ClusterSize   int
-	NetworkConfig NetworkConfig
+	ClusterSize        int
+	NetworkConfig      NetworkConfig
+	NumberOfPartitions int
 }
 
 func (c *ClusterConfig) withThreeNodesPerfectNetwork() ClusterConfig {

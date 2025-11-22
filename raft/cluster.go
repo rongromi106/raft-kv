@@ -8,11 +8,13 @@ import (
 )
 
 type MemoryCluster struct {
-	nodes         map[NodeID]*RaftNode
-	logger        *log.Logger
-	currentLeader NodeID
-	tracker       *ElectionTracker
-	network       *NetworkSimulator
+	nodes              map[NodeID]*RaftNode
+	logger             *log.Logger
+	currentLeader      NodeID
+	tracker            *ElectionTracker
+	network            *NetworkSimulator
+	numberOfPartitions int
+	partitions         map[NodeID]int
 }
 
 type Cluster interface {
@@ -26,16 +28,19 @@ type Cluster interface {
 	KillCurrentLeader() NodeID
 	SendRoleChange(node NodeID, term Term, oldRole, newRole Role)
 	ElectionSamples() []time.Duration
+	CreatePartitions(numberOfPartitions int)
 }
 
 func NewMemoryCluster(cfg *ClusterConfig) Cluster {
 	if cfg == nil {
 		def := (&ClusterConfig{}).withThreeNodesPerfectNetwork()
+		def.NumberOfPartitions = 1
 		cfg = &def
 	}
 	cluster := &MemoryCluster{
-		nodes:  make(map[NodeID]*RaftNode),
-		logger: log.Default(),
+		nodes:              make(map[NodeID]*RaftNode),
+		logger:             log.Default(),
+		numberOfPartitions: cfg.NumberOfPartitions,
 	}
 	for i := 0; i < cfg.ClusterSize; i++ {
 		node := NewRaftNode(Config{
@@ -67,18 +72,42 @@ func NewMemoryCluster(cfg *ClusterConfig) Cluster {
 }
 
 func (c *MemoryCluster) SendAppendEntries(from, to NodeID, req *AppendEntriesRequest) {
+	// stop cross partition RPC
+	if c.numberOfPartitions > 1 {
+		if c.partitions[from] != c.partitions[to] {
+			return
+		}
+	}
 	c.network.SendAppendEntries(from, to, req)
 }
 
 func (c *MemoryCluster) SendRequestVote(from, to NodeID, req *RequestVoteRequest) {
+	// stop cross partition RPC
+	if c.numberOfPartitions > 1 {
+		if c.partitions[from] != c.partitions[to] {
+			return
+		}
+	}
 	c.network.SendRequestVote(from, to, req)
 }
 
 func (c *MemoryCluster) SendRequestVoteResponse(from, to NodeID, resp *RequestVoteResponse) {
+	// stop cross partition RPC
+	if c.numberOfPartitions > 1 {
+		if c.partitions[from] != c.partitions[to] {
+			return
+		}
+	}
 	c.network.SendRequestVoteResponse(from, to, resp)
 }
 
 func (c *MemoryCluster) SendAppendEntriesResponse(from, to NodeID, resp *AppendEntriesResponse) {
+	// stop cross partition RPC
+	if c.numberOfPartitions > 1 {
+		if c.partitions[from] != c.partitions[to] {
+			return
+		}
+	}
 	c.network.SendAppendEntriesResponse(from, to, resp)
 }
 
@@ -117,4 +146,20 @@ func (c *MemoryCluster) SendRoleChange(node NodeID, term Term, oldRole, newRole 
 
 func (c *MemoryCluster) ElectionSamples() []time.Duration {
 	return c.tracker.Samples()
+}
+
+func (c *MemoryCluster) CreatePartitions(numberOfPartitions int) {
+	// set and validate partition count
+	c.numberOfPartitions = numberOfPartitions
+	if c.numberOfPartitions <= 1 {
+		return
+	}
+	c.partitions = make(map[NodeID]int)
+	count := 0
+	for nodeId := range c.nodes {
+		partitionId := count % c.numberOfPartitions
+		c.partitions[nodeId] = partitionId
+		c.logger.Printf("[cluster] assigned node %s to partition %d", nodeId, partitionId)
+		count++
+	}
 }
