@@ -14,12 +14,18 @@ type RaftState struct {
 
 	role      Role
 	voteCount int
+
+	nextIndex map[NodeID]LogIndex
+
+	matchIndex map[NodeID]LogIndex
 }
 
 func newRaftState() *RaftState {
 	return &RaftState{
-		log:  make([]LogEntry, 0),
-		role: RoleFollower,
+		log:        make([]LogEntry, 0),
+		role:       RoleFollower,
+		nextIndex:  make(map[NodeID]LogIndex),
+		matchIndex: make(map[NodeID]LogIndex),
 	}
 }
 

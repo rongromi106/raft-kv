@@ -62,6 +62,7 @@ func NewMemoryCluster(cfg *ClusterConfig) Cluster {
 			}
 			selfNode.peerIds = append(selfNode.peerIds, NodeID(fmt.Sprintf("node-%d", j)))
 		}
+		selfNode.state.nextIndex = make(map[NodeID]LogIndex)
 	}
 	cluster.tracker = NewElectionTracker(cluster.nodes)
 	// Initialize network simulator from config (defaults ensured by withThreeNodesPerfectNetwork).

@@ -214,6 +214,10 @@ func (n *RaftNode) handleRPC(msg RPCMessage) {
 		n.logger.Printf("[node %s] received AppendEntriesResponse from=%s (term=%d)",
 			n.id, msg.From, msg.AppendEntriesResp.Term)
 		n.handleAppendEntriesResponse(msg.AppendEntriesResp)
+	case RPCClientPut:
+		n.logger.Printf("[node %s] received ClientPut request from=%s (key=%s)",
+			n.id, msg.From, msg.ClientPutReq.Key)
+		n.handleClientPut(msg.ClientPutReq)
 	default:
 		term, role := n.state.getTermAndRole()
 		n.logger.Printf("[node %s] received RPC type=%v from=%s (term=%d, role=%s) [no-op in Milestone1]",
@@ -322,6 +326,7 @@ func (n *RaftNode) handleRequestVoteResponse(resp *RequestVoteResponse) {
 				n.onRoleChange(term, oldRole, RoleLeader)
 			}
 			n.cluster.SetCurrentLeader(n.id)
+			n.OnBecomeLeader()
 			n.startHeartbeat()
 			return
 		}
@@ -329,21 +334,37 @@ func (n *RaftNode) handleRequestVoteResponse(resp *RequestVoteResponse) {
 	n.state.mu.Unlock()
 }
 
+// Confirmed leader role calling this function
 func (n *RaftNode) startHeartbeat() {
 	n.state.mu.Lock()
 	defer n.state.mu.Unlock()
-
 	for _, peerId := range n.peerIds {
 		if peerId == n.id {
 			continue
 		}
+		var prevLogTerm Term
+		// the index that the follower has sync -ed to
+		prevLogIndex := n.state.nextIndex[peerId] - 1
+		if prevLogIndex == 0 {
+			prevLogTerm = 0
+		} else {
+			// translate logical index to slice offset; example if dense 1-based:
+			offset := int(prevLogIndex) - 1
+			if offset >= 0 && offset < len(n.state.log) {
+				prevLogTerm = n.state.log[offset].Term
+			} else {
+				// handle inconsistency: skip or fallback; better add a termAt helper
+				prevLogTerm = 0
+			}
+		}
+
 		n.cluster.SendAppendEntries(n.id, peerId, &AppendEntriesRequest{
 			Term:         n.state.currentTerm,
 			LeaderID:     n.id,
-			PrevLogIndex: 0,
-			PrevLogTerm:  0,
-			Entries:      make([]LogEntry, 0),
-			LeaderCommit: 0,
+			PrevLogIndex: prevLogIndex,
+			PrevLogTerm:  prevLogTerm,
+			Entries:      nil, // empty entries for heartbeat
+			LeaderCommit: n.state.commitIndex,
 			IsHeartbeat:  true,
 		})
 
@@ -354,7 +375,7 @@ func (n *RaftNode) startHeartbeat() {
 
 func (n *RaftNode) handleAppendEntries(req *AppendEntriesRequest) {
 	n.state.mu.Lock()
-
+	// step 1: term check
 	if req.Term > n.state.currentTerm {
 		oldRole := n.state.role
 		n.state.currentTerm = req.Term
@@ -374,6 +395,58 @@ func (n *RaftNode) handleAppendEntries(req *AppendEntriesRequest) {
 			Term:    n.state.currentTerm,
 			Success: false,
 		})
+		n.state.mu.Unlock()
+		return
+	}
+	// step 2: log check
+	if n.state.role == RoleFollower {
+		// Calculate follower's last log index (assuming log indices are 1-based)
+		lastLogIdx := LogIndex(len(n.state.log))
+
+		// Reject if we don't have the entry at PrevLogIndex (except when PrevLogIndex == 0)
+		if req.PrevLogIndex > 0 && req.PrevLogIndex > lastLogIdx {
+			n.cluster.SendAppendEntriesResponse(n.id, req.LeaderID, &AppendEntriesResponse{
+				Term:    n.state.currentTerm,
+				Success: false,
+			})
+			n.state.mu.Unlock()
+			return
+		}
+
+		// If PrevLogIndex > 0, verify term matches at that index
+		if req.PrevLogIndex > 0 {
+			pos := int(req.PrevLogIndex) - 1
+			if pos < 0 || pos >= len(n.state.log) || n.state.log[pos].Term != req.PrevLogTerm {
+				n.cluster.SendAppendEntriesResponse(n.id, req.LeaderID, &AppendEntriesResponse{
+					Term:    n.state.currentTerm,
+					Success: false,
+				})
+				n.state.mu.Unlock()
+				return
+			}
+		}
+
+		// Truncate log to PrevLogIndex (keep entries up to that index), then append new entries
+		truncateLen := int(req.PrevLogIndex)
+		if truncateLen < 0 {
+			truncateLen = 0
+		}
+		if truncateLen > len(n.state.log) {
+			truncateLen = len(n.state.log)
+		}
+		n.state.log = n.state.log[:truncateLen]
+		if len(req.Entries) > 0 {
+			n.state.log = append(n.state.log, req.Entries...)
+		}
+		n.cluster.SendAppendEntriesResponse(n.id, req.LeaderID, &AppendEntriesResponse{
+			Term:    n.state.currentTerm,
+			Success: true,
+		})
+		if len(n.state.log) > 0 {
+			n.state.commitIndex = min(req.LeaderCommit, n.state.log[len(n.state.log)-1].Index)
+		} else {
+			n.state.commitIndex = 0
+		}
 		n.state.mu.Unlock()
 		return
 	}
@@ -405,4 +478,32 @@ func (n *RaftNode) handleAppendEntriesResponse(resp *AppendEntriesResponse) {
 
 func (n *RaftNode) onRoleChange(term Term, oldRole, newRole Role) {
 	n.cluster.SendRoleChange(n.id, term, oldRole, newRole)
+}
+
+// update nextIndex and matchIndex for all followers
+func (n *RaftNode) OnBecomeLeader() {
+	n.state.mu.Lock()
+	defer n.state.mu.Unlock()
+	log.Printf("[node %s] became leader on term %d", n.id, n.state.currentTerm)
+	// Ensure follower tracking maps are initialized
+	if n.state.nextIndex == nil {
+		n.state.nextIndex = make(map[NodeID]LogIndex)
+	}
+	if n.state.matchIndex == nil {
+		n.state.matchIndex = make(map[NodeID]LogIndex)
+	}
+	// Handle empty log safely
+	var lastLogIndex LogIndex
+	if len(n.state.log) == 0 {
+		lastLogIndex = 0
+	} else {
+		lastLogIndex = n.state.log[len(n.state.log)-1].Index
+	}
+	for _, peerId := range n.peerIds {
+		if peerId == n.id {
+			continue
+		}
+		n.state.nextIndex[peerId] = lastLogIndex + 1
+		n.state.matchIndex[peerId] = 0
+	}
 }

@@ -22,6 +22,17 @@ type AppendEntriesResponse struct {
 	Success bool
 }
 
+type ClientPutRequest struct {
+	Key   string
+	Value []byte
+}
+
+type ClientPutResponse struct {
+	Term    Term
+	Success bool
+	Leader  NodeID
+}
+
 type RequestVoteRequest struct {
 	Term        Term
 	CandidateID NodeID
