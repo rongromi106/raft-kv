@@ -214,10 +214,6 @@ func (n *RaftNode) handleRPC(msg RPCMessage) {
 		n.logger.Printf("[node %s] received AppendEntriesResponse from=%s (term=%d)",
 			n.id, msg.From, msg.AppendEntriesResp.Term)
 		n.handleAppendEntriesResponse(msg.AppendEntriesResp)
-	case RPCClientPut:
-		n.logger.Printf("[node %s] received ClientPut request from=%s (key=%s)",
-			n.id, msg.From, msg.ClientPutReq.Key)
-		n.handleClientPut(msg.ClientPutReq)
 	default:
 		term, role := n.state.getTermAndRole()
 		n.logger.Printf("[node %s] received RPC type=%v from=%s (term=%d, role=%s) [no-op in Milestone1]",
@@ -375,82 +371,86 @@ func (n *RaftNode) startHeartbeat() {
 
 func (n *RaftNode) handleAppendEntries(req *AppendEntriesRequest) {
 	n.state.mu.Lock()
-	// step 1: term check
+	// step 1: term check with deferred side effects
+	oldRole := n.state.role
+	stepDown := false
 	if req.Term > n.state.currentTerm {
-		oldRole := n.state.role
 		n.state.currentTerm = req.Term
 		n.state.votedFor = nil
 		n.state.role = RoleFollower
 		n.state.voteCount = 0
-		term := n.state.currentTerm
-		// step down: ensure we stop heartbeats
-		n.state.mu.Unlock()
-		n.stopHeartbeatTimer()
-		if oldRole != RoleFollower {
-			n.onRoleChange(term, oldRole, RoleFollower)
-		}
-		return
+		stepDown = (oldRole != RoleFollower)
 	} else if req.Term < n.state.currentTerm {
+		term := n.state.currentTerm
+		n.state.mu.Unlock()
 		n.cluster.SendAppendEntriesResponse(n.id, req.LeaderID, &AppendEntriesResponse{
-			Term:    n.state.currentTerm,
+			Term:    term,
 			Success: false,
 		})
-		n.state.mu.Unlock()
 		return
 	}
-	// step 2: log check
+	// step 2: log check and state update under lock, then send response after unlock
+	success := false
 	if n.state.role == RoleFollower {
 		// Calculate follower's last log index (assuming log indices are 1-based)
 		lastLogIdx := LogIndex(len(n.state.log))
 
 		// Reject if we don't have the entry at PrevLogIndex (except when PrevLogIndex == 0)
 		if req.PrevLogIndex > 0 && req.PrevLogIndex > lastLogIdx {
-			n.cluster.SendAppendEntriesResponse(n.id, req.LeaderID, &AppendEntriesResponse{
-				Term:    n.state.currentTerm,
-				Success: false,
-			})
-			n.state.mu.Unlock()
-			return
-		}
-
-		// If PrevLogIndex > 0, verify term matches at that index
-		if req.PrevLogIndex > 0 {
-			pos := int(req.PrevLogIndex) - 1
-			if pos < 0 || pos >= len(n.state.log) || n.state.log[pos].Term != req.PrevLogTerm {
-				n.cluster.SendAppendEntriesResponse(n.id, req.LeaderID, &AppendEntriesResponse{
-					Term:    n.state.currentTerm,
-					Success: false,
-				})
-				n.state.mu.Unlock()
-				return
+			success = false
+		} else {
+			// If PrevLogIndex > 0, verify term matches at that index
+			if req.PrevLogIndex > 0 {
+				pos := int(req.PrevLogIndex) - 1
+				if pos < 0 || pos >= len(n.state.log) || n.state.log[pos].Term != req.PrevLogTerm {
+					success = false
+				} else {
+					// Truncate and append
+					truncateLen := int(req.PrevLogIndex)
+					if truncateLen < 0 {
+						truncateLen = 0
+					}
+					if truncateLen > len(n.state.log) {
+						truncateLen = len(n.state.log)
+					}
+					n.state.log = n.state.log[:truncateLen]
+					if len(req.Entries) > 0 {
+						n.state.log = append(n.state.log, req.Entries...)
+					}
+					if len(n.state.log) > 0 {
+						n.state.commitIndex = min(req.LeaderCommit, n.state.log[len(n.state.log)-1].Index)
+					} else {
+						n.state.commitIndex = 0
+					}
+					success = true
+				}
+			} else {
+				// PrevLogIndex == 0, append at beginning
+				n.state.log = n.state.log[:0]
+				if len(req.Entries) > 0 {
+					n.state.log = append(n.state.log, req.Entries...)
+				}
+				if len(n.state.log) > 0 {
+					n.state.commitIndex = min(req.LeaderCommit, n.state.log[len(n.state.log)-1].Index)
+				} else {
+					n.state.commitIndex = 0
+				}
+				success = true
 			}
 		}
-
-		// Truncate log to PrevLogIndex (keep entries up to that index), then append new entries
-		truncateLen := int(req.PrevLogIndex)
-		if truncateLen < 0 {
-			truncateLen = 0
-		}
-		if truncateLen > len(n.state.log) {
-			truncateLen = len(n.state.log)
-		}
-		n.state.log = n.state.log[:truncateLen]
-		if len(req.Entries) > 0 {
-			n.state.log = append(n.state.log, req.Entries...)
-		}
-		n.cluster.SendAppendEntriesResponse(n.id, req.LeaderID, &AppendEntriesResponse{
-			Term:    n.state.currentTerm,
-			Success: true,
-		})
-		if len(n.state.log) > 0 {
-			n.state.commitIndex = min(req.LeaderCommit, n.state.log[len(n.state.log)-1].Index)
-		} else {
-			n.state.commitIndex = 0
-		}
-		n.state.mu.Unlock()
-		return
 	}
+	term := n.state.currentTerm
 	n.state.mu.Unlock()
+	// perform side effects after unlock
+	if stepDown && oldRole != RoleFollower {
+		n.stopHeartbeatTimer()
+		n.onRoleChange(term, oldRole, RoleFollower)
+	}
+	// send response
+	n.cluster.SendAppendEntriesResponse(n.id, req.LeaderID, &AppendEntriesResponse{
+		Term:    term,
+		Success: success,
+	})
 }
 
 func (n *RaftNode) handleAppendEntriesResponse(resp *AppendEntriesResponse) {
