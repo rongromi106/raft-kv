@@ -18,8 +18,11 @@ type AppendEntriesRequest struct {
 }
 
 type AppendEntriesResponse struct {
+	From    NodeID
 	Term    Term
 	Success bool
+	// ACK Index by follower
+	AckIndex LogIndex
 }
 
 type ClientPutRequest struct {

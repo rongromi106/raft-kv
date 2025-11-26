@@ -180,3 +180,78 @@ func TestAppendEntries_CommitIndexCappedByLastIndex(t *testing.T) {
 		t.Fatalf("expected commitIndex capped at 2, got %d", follower.state.commitIndex)
 	}
 }
+
+func TestHandleAppendEntriesResponse_InconsistencyBackoff_NoStepDown(t *testing.T) {
+	leader, _ := newTestNode(t, NodeID("leader"))
+	leader.state.role = RoleLeader
+	leader.state.currentTerm = 2
+	leader.peerIds = []NodeID{"f1", "f2"}
+	leader.state.nextIndex = map[NodeID]LogIndex{"f1": 5, "f2": 5}
+	leader.state.matchIndex = map[NodeID]LogIndex{"f1": 0, "f2": 0}
+
+	resp := &AppendEntriesResponse{
+		From:    NodeID("f1"),
+		Term:    2,
+		Success: false, // log inconsistency at follower
+	}
+	leader.handleAppendEntriesResponse(resp)
+
+	if leader.state.role != RoleLeader {
+		t.Fatalf("expected role to remain leader, got %v", leader.state.role)
+	}
+	if got := leader.state.nextIndex["f1"]; got != 4 {
+		t.Fatalf("expected nextIndex[f1] to back off to 4, got %d", got)
+	}
+	if got := leader.state.matchIndex["f1"]; got != 0 {
+		t.Fatalf("expected matchIndex[f1] unchanged (0), got %d", got)
+	}
+}
+
+func TestHandleAppendEntriesResponse_SuccessUpdatesCommit_MajorityCurrentTerm(t *testing.T) {
+	leader, _ := newTestNode(t, NodeID("leader"))
+	leader.state.role = RoleLeader
+	leader.state.currentTerm = 3
+	leader.peerIds = []NodeID{"f1", "f2"}
+	leader.state.log = []LogEntry{
+		{Term: 1, Index: 1, Command: []byte("a")},
+		{Term: 2, Index: 2, Command: []byte("b")},
+		{Term: 3, Index: 3, Command: []byte("c")},
+	}
+	leader.OnBecomeLeader()
+	// Sanity: nextIndex should be 4 for followers, matchIndex 0
+	if leader.state.nextIndex["f1"] != 4 || leader.state.nextIndex["f2"] != 4 {
+		t.Fatalf("expected nextIndex initialized to 4")
+	}
+
+	// First, simulate both followers only matched up to index 2 (prior term).
+	leader.state.matchIndex["f1"] = 2
+	leader.state.matchIndex["f2"] = 2
+	leader.state.commitIndex = 0
+	leader.handleAppendEntriesResponse(&AppendEntriesResponse{
+		From:     "f1",
+		Term:     3,
+		Success:  true,
+		AckIndex: 2,
+	})
+	if leader.state.commitIndex != 0 {
+		t.Fatalf("should not commit index 2 (not current term); got commitIndex=%d", leader.state.commitIndex)
+	}
+
+	// Now, majority acknowledges index 3 (current term); commit should advance to 3.
+	leader.state.matchIndex["f2"] = 3
+	leader.handleAppendEntriesResponse(&AppendEntriesResponse{
+		From:     "f1",
+		Term:     3,
+		Success:  true,
+		AckIndex: 3,
+	})
+	if leader.state.matchIndex["f1"] != 3 {
+		t.Fatalf("expected matchIndex[f1]=3, got %d", leader.state.matchIndex["f1"])
+	}
+	if leader.state.nextIndex["f1"] != 4 {
+		t.Fatalf("expected nextIndex[f1]=4, got %d", leader.state.nextIndex["f1"])
+	}
+	if leader.state.commitIndex != 3 {
+		t.Fatalf("expected commitIndex=3 after majority on current term, got %d", leader.state.commitIndex)
+	}
+}

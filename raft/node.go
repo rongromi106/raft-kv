@@ -374,6 +374,7 @@ func (n *RaftNode) handleAppendEntries(req *AppendEntriesRequest) {
 	// step 1: term check with deferred side effects
 	oldRole := n.state.role
 	stepDown := false
+	ackIndex := LogIndex(0)
 	if req.Term > n.state.currentTerm {
 		n.state.currentTerm = req.Term
 		n.state.votedFor = nil
@@ -384,6 +385,7 @@ func (n *RaftNode) handleAppendEntries(req *AppendEntriesRequest) {
 		term := n.state.currentTerm
 		n.state.mu.Unlock()
 		n.cluster.SendAppendEntriesResponse(n.id, req.LeaderID, &AppendEntriesResponse{
+			From:    n.id,
 			Term:    term,
 			Success: false,
 		})
@@ -398,12 +400,14 @@ func (n *RaftNode) handleAppendEntries(req *AppendEntriesRequest) {
 		// Reject if we don't have the entry at PrevLogIndex (except when PrevLogIndex == 0)
 		if req.PrevLogIndex > 0 && req.PrevLogIndex > lastLogIdx {
 			success = false
+			ackIndex = lastLogIdx
 		} else {
 			// If PrevLogIndex > 0, verify term matches at that index
 			if req.PrevLogIndex > 0 {
 				pos := int(req.PrevLogIndex) - 1
 				if pos < 0 || pos >= len(n.state.log) || n.state.log[pos].Term != req.PrevLogTerm {
 					success = false
+					ackIndex = req.PrevLogIndex - 1
 				} else {
 					// Truncate and append
 					truncateLen := int(req.PrevLogIndex)
@@ -422,6 +426,8 @@ func (n *RaftNode) handleAppendEntries(req *AppendEntriesRequest) {
 					} else {
 						n.state.commitIndex = 0
 					}
+					// ack up to prev + appended
+					ackIndex = req.PrevLogIndex + LogIndex(len(req.Entries))
 					success = true
 				}
 			} else {
@@ -435,6 +441,8 @@ func (n *RaftNode) handleAppendEntries(req *AppendEntriesRequest) {
 				} else {
 					n.state.commitIndex = 0
 				}
+				// ack up to appended length
+				ackIndex = LogIndex(len(req.Entries))
 				success = true
 			}
 		}
@@ -448,31 +456,83 @@ func (n *RaftNode) handleAppendEntries(req *AppendEntriesRequest) {
 	}
 	// send response
 	n.cluster.SendAppendEntriesResponse(n.id, req.LeaderID, &AppendEntriesResponse{
-		Term:    term,
-		Success: success,
+		From:     n.id,
+		Term:     term,
+		Success:  success,
+		AckIndex: ackIndex,
 	})
 }
 
 func (n *RaftNode) handleAppendEntriesResponse(resp *AppendEntriesResponse) {
 	n.state.mu.Lock()
 
-	if !resp.Success {
-		oldRole := n.state.role
-		n.state.currentTerm = resp.Term
-		n.state.votedFor = nil
-		n.state.role = RoleFollower
-		n.state.voteCount = 0
-		term := n.state.currentTerm
+	// Ignore stale term responses
+	if resp.Term < n.state.currentTerm {
 		n.state.mu.Unlock()
-		n.stopHeartbeatTimer()
-		n.resetElectionTimerByMode()
-		if oldRole != RoleFollower {
-			n.onRoleChange(term, oldRole, RoleFollower)
-		}
 		return
 	}
 
-	// TODO: handle success
+	if !resp.Success {
+		// step down to follower
+		if resp.Term > n.state.currentTerm {
+			oldRole := n.state.role
+			n.state.currentTerm = resp.Term
+			n.state.votedFor = nil
+			n.state.role = RoleFollower
+			n.state.voteCount = 0
+			term := n.state.currentTerm
+			n.state.mu.Unlock()
+			n.stopHeartbeatTimer()
+			n.resetElectionTimerByMode()
+			if oldRole != RoleFollower {
+				n.onRoleChange(term, oldRole, RoleFollower)
+			}
+			return
+		} else if resp.Term == n.state.currentTerm {
+			/*
+				If resp.Term == currentTerm and !resp.Success: treat as log inconsistency;
+				do NOT step down. Decrement or jump nextIndex[peer] and retry AppendEntries.
+			*/
+			if n.state.nextIndex[resp.From] > 1 {
+				n.state.nextIndex[resp.From] = n.state.nextIndex[resp.From] - 1
+			} else {
+				n.state.nextIndex[resp.From] = 1
+			}
+
+		}
+
+	} else {
+		n.state.matchIndex[resp.From] = resp.AckIndex
+		n.state.nextIndex[resp.From] = resp.AckIndex + 1
+
+		// update commit index based on majority match in current term
+		if len(n.state.log) > 0 {
+			currentTerm := n.state.currentTerm
+			lastIndex := n.state.log[len(n.state.log)-1].Index
+			newCommit := n.state.commitIndex
+			totalNodes := len(n.peerIds) + 1
+			required := totalNodes/2 + 1
+			for i := n.state.commitIndex + 1; i <= lastIndex; i++ {
+				// only commit entries from current term
+				pos := int(i) - 1
+				if pos < 0 || pos >= len(n.state.log) || n.state.log[pos].Term != currentTerm {
+					continue
+				}
+				peerMatches := 0
+				for _, peerId := range n.peerIds {
+					if n.state.matchIndex[peerId] >= i {
+						peerMatches++
+					}
+				}
+				matched := 1 + peerMatches // include leader
+				if matched >= required {
+					newCommit = i
+				}
+			}
+			n.state.commitIndex = newCommit
+		}
+	}
+
 	n.state.mu.Unlock()
 }
 
