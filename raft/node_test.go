@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 )
@@ -181,6 +182,81 @@ func TestAppendEntries_CommitIndexCappedByLastIndex(t *testing.T) {
 	}
 }
 
+func TestApplyEntries_LeaderAndFollower(t *testing.T) {
+	// Follower applies entries when commitIndex advances from AppendEntries
+	{
+		follower, _ := newTestNode(t, NodeID("f-apply"))
+		follower.state.currentTerm = 1
+		cmd := KVCommand{Op: OpPut, Key: "kf", Value: "vf"}
+		payload, err := json.Marshal(cmd)
+		if err != nil {
+			t.Fatalf("marshal follower cmd: %v", err)
+		}
+		req := &AppendEntriesRequest{
+			Term:         1,
+			LeaderID:     "leader-x",
+			PrevLogIndex: 0,
+			PrevLogTerm:  0,
+			Entries: []LogEntry{
+				{Term: 1, Index: 1, Command: payload},
+			},
+			LeaderCommit: 1,
+		}
+		follower.handleAppendEntries(req)
+		// Wait for async apply
+		deadline := time.Now().Add(500 * time.Millisecond)
+		for {
+			follower.kvstore.mu.Lock()
+			val, ok := follower.kvstore.data["kf"]
+			follower.kvstore.mu.Unlock()
+			if ok && val == "vf" {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("follower did not apply entry: got ok=%v val=%q", ok, val)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	// Leader applies entries when commitIndex advances by majority acknowledgements
+	{
+		leader, _ := newTestNode(t, NodeID("leader-apply"))
+		leader.state.currentTerm = 2
+		leader.state.role = RoleLeader
+		leader.peerIds = []NodeID{"f1", "f2"}
+		cmd := KVCommand{Op: OpPut, Key: "kl", Value: "vl"}
+		payload, err := json.Marshal(cmd)
+		if err != nil {
+			t.Fatalf("marshal leader cmd: %v", err)
+		}
+		leader.state.log = []LogEntry{
+			{Term: 2, Index: 1, Command: payload},
+		}
+		leader.OnBecomeLeader()
+		// One follower acks index 1 -> majority (leader + f1) commits index 1 (current term)
+		leader.handleAppendEntriesResponse(&AppendEntriesResponse{
+			From:     "f1",
+			Term:     2,
+			Success:  true,
+			AckIndex: 1,
+		})
+		// Wait for async apply
+		deadline := time.Now().Add(500 * time.Millisecond)
+		for {
+			leader.kvstore.mu.Lock()
+			val, ok := leader.kvstore.data["kl"]
+			leader.kvstore.mu.Unlock()
+			if ok && val == "vl" {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("leader did not apply entry: got ok=%v val=%q", ok, val)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+}
 func TestHandleAppendEntriesResponse_InconsistencyBackoff_NoStepDown(t *testing.T) {
 	leader, _ := newTestNode(t, NodeID("leader"))
 	leader.state.role = RoleLeader

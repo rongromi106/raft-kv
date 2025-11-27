@@ -29,6 +29,8 @@ type RaftNode struct {
 	mu sync.Mutex
 
 	peerIds []NodeID
+
+	kvstore *KVStore
 }
 
 func NewRaftNode(cfg Config, cluster Cluster) *RaftNode {
@@ -45,6 +47,7 @@ func NewRaftNode(cfg Config, cluster Cluster) *RaftNode {
 		recvRPCCh: make(chan RPCMessage, 16),
 		stopCh:    make(chan struct{}),
 		stopped:   make(chan struct{}),
+		kvstore:   NewKVStore(),
 	}
 
 	// Initialize per-node fixed election timeout if configured
@@ -339,7 +342,9 @@ func (n *RaftNode) startHeartbeat() {
 			continue
 		}
 		var prevLogTerm Term
-		// the index that the follower has sync -ed to
+		// the index that the follower was supposed to sync -ed to
+		// last log item for leader, this is different than the last applied or commit index for
+		// both leader and follower.
 		prevLogIndex := n.state.nextIndex[peerId] - 1
 		if prevLogIndex == 0 {
 			prevLogTerm = 0
@@ -375,6 +380,7 @@ func (n *RaftNode) handleAppendEntries(req *AppendEntriesRequest) {
 	oldRole := n.state.role
 	stepDown := false
 	ackIndex := LogIndex(0)
+	var toApplyFollower []LogEntry
 	if req.Term > n.state.currentTerm {
 		n.state.currentTerm = req.Term
 		n.state.votedFor = nil
@@ -446,9 +452,37 @@ func (n *RaftNode) handleAppendEntries(req *AppendEntriesRequest) {
 				success = true
 			}
 		}
+
+		// follower prepares entries to apply: [lastApplied+1, commitIndex]
+		start := n.state.lastApplied + 1
+		end := n.state.commitIndex
+		if end >= start && end > 0 && len(n.state.log) > 0 {
+			lo := int(start) - 1
+			if lo < 0 {
+				lo = 0
+			}
+			hi := int(end)
+			if hi > len(n.state.log) {
+				hi = len(n.state.log)
+			}
+			if lo < hi {
+				toApplyFollower = append([]LogEntry(nil), n.state.log[lo:hi]...)
+				n.state.lastApplied = end
+			}
+		}
 	}
 	term := n.state.currentTerm
 	n.state.mu.Unlock()
+	// follower applies outside lock
+	if len(toApplyFollower) > 0 {
+		go func(entries []LogEntry) {
+			for _, entry := range entries {
+				if err := n.kvstore.Apply(entry.Command); err != nil {
+					n.logger.Printf("[node %s] failed to apply command: %v", n.id, err)
+				}
+			}
+		}(toApplyFollower)
+	}
 	// perform side effects after unlock
 	if stepDown && oldRole != RoleFollower {
 		n.stopHeartbeatTimer()
@@ -464,6 +498,7 @@ func (n *RaftNode) handleAppendEntries(req *AppendEntriesRequest) {
 }
 
 func (n *RaftNode) handleAppendEntriesResponse(resp *AppendEntriesResponse) {
+	var toApplyLeader []LogEntry
 	n.state.mu.Lock()
 
 	// Ignore stale term responses
@@ -529,11 +564,38 @@ func (n *RaftNode) handleAppendEntriesResponse(resp *AppendEntriesResponse) {
 					newCommit = i
 				}
 			}
+			// prepare leader apply slice from lastApplied+1 to newCommit
+			if newCommit > n.state.lastApplied {
+				start := n.state.lastApplied + 1
+				end := newCommit
+				lo := int(start) - 1
+				if lo < 0 {
+					lo = 0
+				}
+				hi := int(end)
+				if hi > len(n.state.log) {
+					hi = len(n.state.log)
+				}
+				if lo < hi {
+					toApplyLeader = append([]LogEntry(nil), n.state.log[lo:hi]...)
+					n.state.lastApplied = end
+				}
+			}
 			n.state.commitIndex = newCommit
 		}
 	}
 
 	n.state.mu.Unlock()
+	// leader applies outside lock to prevent go routine to access shared state (racy)
+	if len(toApplyLeader) > 0 {
+		go func(entries []LogEntry) {
+			for _, entry := range entries {
+				if err := n.kvstore.Apply(entry.Command); err != nil {
+					n.logger.Printf("[node %s] failed to apply command: %v", n.id, err)
+				}
+			}
+		}(toApplyLeader)
+	}
 }
 
 func (n *RaftNode) onRoleChange(term Term, oldRole, newRole Role) {
