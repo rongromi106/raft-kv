@@ -247,13 +247,18 @@ func (n *RaftNode) startElection() {
 		n.onRoleChange(term, oldRole, RoleCandidate)
 	}
 	currentTerm := term
+	myLastLogIndex := LogIndex(0)
+	myLastLogTerm := Term(0)
+	if len(n.state.log) > 0 {
+		myLastLogIndex = n.state.log[len(n.state.log)-1].Index
+		myLastLogTerm = n.state.log[len(n.state.log)-1].Term
+	}
 	for _, peerId := range n.peerIds {
-		// TODO: fix lastlog index and last log term in milestone 3
 		n.cluster.SendRequestVote(n.id, peerId, &RequestVoteRequest{
 			Term:         currentTerm,
 			CandidateID:  n.id,
-			LastLogIndex: 0,
-			LastLogTerm:  0,
+			LastLogIndex: myLastLogIndex,
+			LastLogTerm:  myLastLogTerm,
 		})
 	}
 	n.resetElectionTimerByMode()
@@ -289,8 +294,29 @@ func (n *RaftNode) handleRequestVote(req *RequestVoteRequest) {
 
 	// Term is now equal to req.Term
 	if n.state.votedFor == nil || (n.state.votedFor != nil && *n.state.votedFor == req.CandidateID) {
-		n.state.votedFor = &req.CandidateID
-		grant = true
+		// log freshness check: only grant a vote to a candidate whose log is at least as up-to-date as their own.
+		myLastLogIndex := LogIndex(0)
+		myLastLogTerm := Term(0)
+		if len(n.state.log) > 0 {
+			myLastLogIndex = n.state.log[len(n.state.log)-1].Index
+			myLastLogTerm = n.state.log[len(n.state.log)-1].Term
+		}
+		// candidate is up-to-date if higher term, or same term with >= index
+		upToDate := (req.LastLogTerm > myLastLogTerm) ||
+			(req.LastLogTerm == myLastLogTerm && req.LastLogIndex >= myLastLogIndex)
+		if n.state.votedFor == nil || (n.state.votedFor != nil && *n.state.votedFor == req.CandidateID) {
+			if !upToDate {
+				term := n.state.currentTerm
+				n.state.mu.Unlock()
+				n.cluster.SendRequestVoteResponse(n.id, req.CandidateID, &RequestVoteResponse{
+					Term:        term,
+					VoteGranted: false,
+				})
+				return
+			}
+			n.state.votedFor = &req.CandidateID
+			grant = true
+		}
 	}
 	term := n.state.currentTerm
 	candidateID := req.CandidateID
