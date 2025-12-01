@@ -50,3 +50,9 @@ func (kv *KVStore) Apply(command []byte) error {
 
 	return nil
 }
+
+func (kv *KVStore) Get(key string) string {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	return kv.data[key]
+}

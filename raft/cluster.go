@@ -15,6 +15,7 @@ type MemoryCluster struct {
 	network            *NetworkSimulator
 	numberOfPartitions int
 	partitions         map[NodeID]int
+	queue              chan ClientPutRequest
 }
 
 type Cluster interface {
@@ -29,7 +30,10 @@ type Cluster interface {
 	SendRoleChange(node NodeID, term Term, oldRole, newRole Role)
 	ElectionSamples() []time.Duration
 	CreatePartitions(numberOfPartitions int)
-	SendClientPut(key string, value []byte)
+	// Client put request ingress and subscription
+	SendClientPut(req ClientPutRequest)
+	ClientPutRequests() <-chan ClientPutRequest
+	Get(key string) string
 }
 
 func NewMemoryCluster(cfg *ClusterConfig) Cluster {
@@ -42,6 +46,7 @@ func NewMemoryCluster(cfg *ClusterConfig) Cluster {
 		nodes:              make(map[NodeID]*RaftNode),
 		logger:             log.Default(),
 		numberOfPartitions: cfg.NumberOfPartitions,
+		queue:              make(chan ClientPutRequest, 100),
 	}
 	for i := 0; i < cfg.ClusterSize; i++ {
 		node := NewRaftNode(Config{
@@ -164,4 +169,18 @@ func (c *MemoryCluster) CreatePartitions(numberOfPartitions int) {
 		c.logger.Printf("[cluster] assigned node %s to partition %d", nodeId, partitionId)
 		count++
 	}
+}
+
+func (c *MemoryCluster) SendClientPut(req ClientPutRequest) {
+	go func() {
+		c.queue <- req
+	}()
+}
+
+func (c *MemoryCluster) ClientPutRequests() <-chan ClientPutRequest {
+	return c.queue
+}
+
+func (c *MemoryCluster) Get(key string) string {
+	return c.nodes[c.currentLeader].kvstore.Get(key)
 }

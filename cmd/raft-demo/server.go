@@ -34,6 +34,7 @@ func StartServer(ctx context.Context, addr string) error {
 		w.Write([]byte("Hello, World!"))
 	})
 	mux.HandleFunc("/put", putHandler)
+	mux.HandleFunc("/get", getHandler)
 
 	server := &http.Server{
 		Addr:    addr,
@@ -76,7 +77,7 @@ func putHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var putRequest raft.ClientPutRequest
+	var putRequest ClientPutRequest
 	if err := json.Unmarshal(body, &putRequest); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		w.Write([]byte("Invalid request body"))
@@ -84,7 +85,23 @@ func putHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// send the key / value pairs to the cluster
-
+	cluster.SendClientPut(raft.ClientPutRequest{
+		Key:   putRequest.Key,
+		Value: []byte(putRequest.Value),
+	})
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
+}
+
+func getHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		w.Write([]byte("Method not allowed"))
+		return
+	}
+	key := r.URL.Query().Get("key")
+	value := cluster.Get(key)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(value))
 }

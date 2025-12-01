@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -654,4 +655,62 @@ func (n *RaftNode) OnBecomeLeader() {
 		n.state.nextIndex[peerId] = lastLogIndex + 1
 		n.state.matchIndex[peerId] = 0
 	}
+
+	// process new client put requests
+	go func() {
+		for {
+			select {
+			case req := <-n.cluster.ClientPutRequests():
+				// 1) append to leader log
+				n.state.mu.Lock()
+				term := n.state.currentTerm
+				newIdx := LogIndex(len(n.state.log) + 1)
+				cmd := []byte(fmt.Sprintf(`{"op":"put","key":"%s","value":"%s"}`, req.Key, string(req.Value)))
+				n.state.log = append(n.state.log, LogEntry{Term: term, Index: newIdx, Command: cmd})
+				commit := n.state.commitIndex
+				// snapshot nextIndex map to avoid holding lock during sends
+				next := make(map[NodeID]LogIndex, len(n.peerIds))
+				for _, p := range n.peerIds {
+					if p != n.id {
+						next[p] = n.state.nextIndex[p]
+					}
+				}
+				// helper to read term at index i
+				termAt := func(i LogIndex) Term {
+					if i == 0 {
+						return 0
+					}
+					pos := int(i) - 1
+					if pos < 0 || pos >= len(n.state.log) {
+						return 0
+					}
+					return n.state.log[pos].Term
+				}
+				logCopy := append([]LogEntry(nil), n.state.log...) // copy for safe read after unlock
+				n.state.mu.Unlock()
+
+				// 2) send AppendEntries to followers
+				for _, p := range n.peerIds {
+					if p == n.id {
+						continue
+					}
+					prevIdx := next[p] - 1
+					prevTerm := termAt(prevIdx)
+					start := int(max(1, int(next[p]))) - 1
+					entries := append([]LogEntry(nil), logCopy[start:]...)
+					n.cluster.SendAppendEntries(n.id, p, &AppendEntriesRequest{
+						Term:         term,
+						LeaderID:     n.id,
+						PrevLogIndex: prevIdx,
+						PrevLogTerm:  prevTerm,
+						Entries:      entries,
+						LeaderCommit: commit,
+					})
+				}
+			default:
+				// no request now; do nothing
+				return // or sleep/yield if you want this goroutine to keep polling
+			}
+		}
+	}()
 }
