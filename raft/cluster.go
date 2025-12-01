@@ -29,6 +29,7 @@ type Cluster interface {
 	SendRoleChange(node NodeID, term Term, oldRole, newRole Role)
 	ElectionSamples() []time.Duration
 	CreatePartitions(numberOfPartitions int)
+	SendClientPut(key string, value []byte)
 }
 
 func NewMemoryCluster(cfg *ClusterConfig) Cluster {
