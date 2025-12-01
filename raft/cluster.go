@@ -182,5 +182,17 @@ func (c *MemoryCluster) ClientPutRequests() <-chan ClientPutRequest {
 }
 
 func (c *MemoryCluster) Get(key string) string {
-	return c.nodes[c.currentLeader].kvstore.Get(key)
+	if len(c.nodes) == 0 {
+		return ""
+	}
+	// pick a pseudo-random node based on current time
+	nodes := make([]*RaftNode, 0, len(c.nodes))
+	for _, n := range c.nodes {
+		nodes = append(nodes, n)
+	}
+	idx := int(time.Now().UnixNano() % int64(len(nodes)))
+	node := nodes[idx]
+	val := node.kvstore.Get(key)
+	_, role := node.state.getTermAndRole()
+	return fmt.Sprintf("node=%s role=%s value=%s", node.id, role, val)
 }
